@@ -1,0 +1,118 @@
+name: Discover starting URLs
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 9 * * *"  # daily 9:17am ET-ish (UTC scheduler)
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard_index: [0,1,2,3,4,5,6,7]   # 8-way parallel
+        shard_count: [8]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Restore cached outputs
+        uses: actions/cache@v4
+        with:
+          path: outputs
+          key: starting-urls-${{ github.ref_name }}
+          restore-keys: |
+            starting-urls-
+
+      - name: Run discovery shard
+        env:
+          BRAVE_API_KEY: ${{ secrets.BRAVE_API_KEY }}
+        run: |
+          mkdir -p outputs
+          python discover_starting_urls.py \
+            --input data/publications_input.csv \
+            --output outputs/starting_urls_${{ matrix.shard_index }}.csv \
+            --sleep 0.2 \
+            --shard-index ${{ matrix.shard_index }} \
+            --shard-count ${{ matrix.shard_count }} \
+            --existing outputs/merged_starting_urls.csv
+
+      - name: Upload shard artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: starting-urls-shard-${{ matrix.shard_index }}
+          path: outputs/starting_urls_${{ matrix.shard_index }}.csv
+
+  merge:
+    needs: discover
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all shards
+        uses: actions/download-artifact@v4
+        with:
+          pattern: starting-urls-shard-*
+          merge-multiple: true
+          path: outputs
+
+      - name: Merge shards (dedupe)
+        run: |
+          python - << 'PY'
+          import csv, glob, os
+
+          out = "outputs/merged_starting_urls.csv"
+          files = sorted(glob.glob("outputs/starting_urls_*.csv"))
+
+          seen = set()
+          rows_out = []
+
+          for fp in files:
+            with open(fp, newline="", encoding="utf-8") as f:
+              r = csv.DictReader(f)
+              for row in r:
+                key = (
+                  row["publication_id"].strip(),
+                  row["publication"].strip(),
+                  row["author"].strip(),
+                  row["source_url"].strip(),
+                  row["source_url_type"].strip(),
+                )
+                if key in seen:
+                  continue
+                seen.add(key)
+                rows_out.append(row)
+
+          os.makedirs("outputs", exist_ok=True)
+          with open(out, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["publication_id","publication","author","source_url","source_url_type"])
+            w.writeheader()
+            w.writerows(rows_out)
+
+          print(f"Merged {len(files)} files -> {len(rows_out)} rows")
+          PY
+
+      - name: Upload merged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: merged-starting-urls
+          path: outputs/merged_starting_urls.csv
+
+      - name: Save merged to cache
+        uses: actions/cache@v4
+        with:
+          path: outputs
+          key: starting-urls-${{ github.ref_name }}
