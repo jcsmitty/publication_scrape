@@ -1,47 +1,37 @@
 #!/usr/bin/env python3
 """
-discover_starting_urls.py
+discover_starting_urls.py  (TWO-PHASE, OFFICIAL-DOMAIN-FIRST)
 
-Stage 1 (Search API only): discover "starting" URLs for later crawling.
+Two-phase discovery (Search API only, no crawling):
+PHASE 1: Find the publication's official HOME domain (publication_home).
+PHASE 2: Constrain subsequent discovery to that domain using `site:...`
+         to find publication_review (or best section page) and author pages.
 
 INPUT CSV header (exact):
   publisher,rt_publisher_url,authors
 
-- publisher: publication name (string)
-- rt_publisher_url: use as publication_id in output (string)
-- authors: optional; if present, treated as "publication has authors"
-          delimiter recommended: ';' or '|' (commas can break "Last, First")
-
 OUTPUT CSV header (exact; 5 columns):
   publication_id,publication,author,source_url,source_url_type
 
-Where source_url_type ∈:
-  - publication_review
-  - publication_home
-  - publication_with_author
+Where:
+- publication_id = rt_publisher_url
+- publication     = publisher
+- author          = author (blank if none)
+- source_url_type ∈ { publication_home, publication_review, publication_with_author }
 
-Rules:
-- If authors is empty:
-    emit up to 2 rows:
-      (publication_review) best review index page we can find
-      (publication_home)   best homepage/official site we can find
-- If authors is present:
-    for each author, emit 1 row:
-      (publication_with_author) best author page inside that publication
+Hard constraints:
+- source_url must NOT be on Rotten Tomatoes or other blocked domains.
+- Prefer domains that match publication tokens.
 
-Speed features for GitHub Actions:
-- Sharding:
-    --shard-index i --shard-count n
-    processes only rows where (row_number % n == i)
-- Incremental skip:
-    --existing merged_starting_urls.csv
-    skips (publication_id, author, source_url_type) already present
+Speed features (GitHub Actions):
+- --shard-index / --shard-count
+- --existing merged_starting_urls.csv  (skip already-discovered keys)
+- Keep --sleep small (0.0–0.3)
 
-Brave Search API:
-- set env var BRAVE_API_KEY
-- uses Brave Web Search endpoint
+Env var:
+- BRAVE_API_KEY
 
-Usage examples:
+Usage:
   export BRAVE_API_KEY="..."
   python discover_starting_urls.py \
     --input data/publications_input.csv \
@@ -63,6 +53,20 @@ import requests
 
 BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
 
+# Domains we never want as "source" pages.
+BLOCKED_DOMAINS = {
+    "rottentomatoes.com", "www.rottentomatoes.com",
+    "metacritic.com", "www.metacritic.com",
+    "imdb.com", "www.imdb.com",
+    "letterboxd.com", "www.letterboxd.com",
+    "wikipedia.org", "www.wikipedia.org",
+    "twitter.com", "x.com", "facebook.com", "instagram.com", "linkedin.com",
+    "youtube.com", "www.youtube.com",
+    "tiktok.com", "www.tiktok.com",
+    "reddit.com", "www.reddit.com",
+    "medium.com",
+}
+
 
 # ----------------------------
 # Utility
@@ -74,14 +78,13 @@ def normalize_ws(s: str) -> str:
 
 def safe_slug(s: str) -> str:
     s = (s or "").lower()
-    s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
-    return s
+    return re.sub(r"[^a-z0-9]+", "-", s).strip("-")
 
 
 def parse_authors(authors_raw: str) -> List[str]:
     """
-    Prefer ';' or '|' as delimiters.
-    Comma split is a last resort (may break 'Last, First').
+    Prefer ';' or '|' delimiters.
+    Comma split is last resort (breaks "Last, First").
     """
     s = normalize_ws(authors_raw)
     if not s:
@@ -92,21 +95,55 @@ def parse_authors(authors_raw: str) -> List[str]:
         parts = [normalize_ws(p) for p in s.split("|")]
     else:
         parts = [normalize_ws(p) for p in s.split(",")]
-    # Deduplicate while keeping order
     seen = set()
     out = []
     for p in parts:
-        if p and p.lower() not in seen:
+        k = p.lower()
+        if p and k not in seen:
             out.append(p)
-            seen.add(p.lower())
+            seen.add(k)
     return out
 
 
-def hostname(url: str) -> str:
+def canonicalize_url(url: str) -> Optional[str]:
+    if not url:
+        return None
+    url = url.strip()
+    if not url:
+        return None
+    p = urllib.parse.urlparse(url)
+    if p.scheme not in ("http", "https"):
+        return None
+
+    # Strip fragment and common tracking params
+    q = urllib.parse.parse_qsl(p.query, keep_blank_values=True)
+    q2 = [(k, v) for (k, v) in q if not re.match(r"^(utm_|fbclid|gclid|mc_cid|mc_eid)", k, re.I)]
+    new_query = urllib.parse.urlencode(q2)
+    p2 = p._replace(query=new_query, fragment="")
+    return p2.geturl()
+
+
+def get_domain(url: str) -> str:
     try:
-        return urllib.parse.urlparse(url).netloc.lower()
+        return urllib.parse.urlparse(url).netloc.lower().split(":")[0]
     except Exception:
         return ""
+
+
+def is_blocked(url: str) -> bool:
+    d = get_domain(url)
+    if not d:
+        return True
+    if d.startswith("www."):
+        d2 = d[4:]
+    else:
+        d2 = d
+    if d in BLOCKED_DOMAINS or d2 in BLOCKED_DOMAINS:
+        return True
+    for bd in BLOCKED_DOMAINS:
+        if d.endswith("." + bd) or d2.endswith("." + bd):
+            return True
+    return False
 
 
 def path_depth(url: str) -> int:
@@ -117,12 +154,66 @@ def path_depth(url: str) -> int:
         return 999
 
 
-def is_social_or_wiki(url: str) -> bool:
-    u = (url or "").lower()
-    return any(d in u for d in [
-        "twitter.com", "x.com", "facebook.com", "instagram.com",
-        "linkedin.com", "wikipedia.org", "imdb.com"
-    ])
+def root_url(url: str) -> Optional[str]:
+    try:
+        p = urllib.parse.urlparse(url)
+        if p.scheme and p.netloc:
+            return f"{p.scheme}://{p.netloc}/"
+    except Exception:
+        pass
+    return None
+
+
+def core_domain(netloc: str) -> str:
+    """
+    Approximate core domain extractor (no external deps).
+    - www.nytimes.com -> nytimes.com
+    - foo.guardian.co.uk -> guardian.co.uk
+    """
+    netloc = (netloc or "").lower().split(":")[0]
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    parts = netloc.split(".")
+    if len(parts) <= 2:
+        return netloc
+    sld = {"co", "com", "org", "net", "gov", "edu"}
+    if parts[-2] in sld and len(parts) >= 3:
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:])
+
+
+def pub_tokens(publisher: str) -> List[str]:
+    """
+    Tokens for domain matching.
+    Drops stopwords and short tokens.
+    """
+    s = (publisher or "").lower()
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    tokens = [t for t in s.split() if t]
+    stop = {"the", "a", "an", "and", "of", "for", "to", "at", "on", "in"}
+    tokens = [t for t in tokens if t not in stop and len(t) >= 4]
+    joined = "".join(tokens)
+    out = list(dict.fromkeys(tokens + ([joined] if len(joined) >= 6 else [])))
+    return out
+
+
+def domain_affinity_score(url: str, publisher: str) -> int:
+    """
+    Boost if core domain contains publisher tokens.
+    """
+    d = core_domain(get_domain(url))
+    toks = pub_tokens(publisher)
+    score = 0
+    for t in toks:
+        if t and t in d:
+            score += 18
+    for t in toks:
+        if d.startswith(t + ".") or d.startswith(t):
+            score += 6
+    # Penalize common hosting platforms that are rarely "official" for pubs
+    if any(x in d for x in ["blogspot.", "wordpress.", "substack.com", "medium.com"]):
+        score -= 12
+    return score
 
 
 # ----------------------------
@@ -133,7 +224,7 @@ def brave_search(api_key: str, query: str, count: int = 8) -> List[Dict]:
     headers = {
         "Accept": "application/json",
         "X-Subscription-Token": api_key,
-        "User-Agent": "RT-StartingURLDiscovery/1.0",
+        "User-Agent": "RT-StartingURLDiscovery/2.0",
     }
     params = {"q": query, "count": count}
     r = requests.get(BRAVE_SEARCH_URL, headers=headers, params=params, timeout=25)
@@ -142,80 +233,45 @@ def brave_search(api_key: str, query: str, count: int = 8) -> List[Dict]:
     return data.get("web", {}).get("results", []) or []
 
 
+def filter_results(results: List[Dict]) -> List[Dict]:
+    out = []
+    for r in results:
+        u = canonicalize_url(r.get("url") or "")
+        if not u:
+            continue
+        if is_blocked(u):
+            continue
+        r2 = dict(r)
+        r2["url"] = u
+        out.append(r2)
+    return out
+
+
 # ----------------------------
-# Scoring heuristics
+# Scoring
 # ----------------------------
 
-def score_publication_review_candidate(url: str, title: str, desc: str) -> int:
+def score_home_candidate(url: str, title: str, desc: str, publisher: str) -> int:
     """
-    Prefer review index/section pages.
-    """
-    u = (url or "").lower()
-    t = (title or "").lower()
-    d = (desc or "").lower()
-    text = f"{u} {t} {d}"
-
-    score = 0
-
-    # Strong review-index signals
-    if re.search(r"/reviews?\b", u):
-        score += 10
-    if any(k in text for k in ["movie reviews", "film reviews", "reviews archive", "review archive"]):
-        score += 10
-    if any(k in u for k in ["/movies/reviews", "/film/reviews", "/cinema/reviews"]):
-        score += 8
-
-    # Medium signals: movie/film sections
-    if any(k in u for k in ["/movies", "/film", "/cinema", "/entertainment"]):
-        score += 4
-    if any(k in text for k in ["movies", "film", "cinema", "entertainment"]):
-        score += 2
-
-    # Prefer section/index pages (shallower)
-    depth = path_depth(url)
-    if depth <= 2:
-        score += 3
-    elif depth >= 6:
-        score -= 3
-
-    # Penalize obvious non-content pages
-    if any(k in u for k in ["/about", "/privacy", "/terms", "/contact", "/subscribe", "/newsletter", "/donate"]):
-        score -= 12
-
-    # Penalize tag/category pages slightly (often noisy, but sometimes OK)
-    if any(k in u for k in ["/tag/", "/tags/", "/category/", "/topics/"]):
-        score -= 2
-
-    # Penalize social / wiki
-    if is_social_or_wiki(u):
-        score -= 25
-
-    return score
-
-
-def score_publication_home_candidate(url: str, title: str, desc: str) -> int:
-    """
-    Prefer the official homepage domain and root-ish URLs, avoid aggregators.
+    Score for PHASE 1: official home domain.
     """
     u = (url or "").lower()
     score = 0
 
-    # Root/home is good
+    score += domain_affinity_score(url, publisher)  # official-domain boost
+
+    # Prefer root-ish URLs
     depth = path_depth(url)
     if depth == 0:
-        score += 10
+        score += 14
     elif depth == 1:
-        score += 6
+        score += 9
     elif depth >= 5:
-        score -= 4
+        score -= 5
 
-    # Avoid obvious junk
-    if any(k in u for k in ["/about", "/privacy", "/terms", "/contact"]):
+    # Penalize non-home pages
+    if any(k in u for k in ["/about", "/privacy", "/terms", "/contact", "/subscribe", "/newsletter", "/donate"]):
         score -= 10
-
-    # Avoid social/wiki
-    if is_social_or_wiki(u):
-        score -= 25
 
     # Prefer https
     if u.startswith("https://"):
@@ -224,9 +280,9 @@ def score_publication_home_candidate(url: str, title: str, desc: str) -> int:
     return score
 
 
-def score_author_candidate(url: str, author: str, publisher: str, title: str, desc: str) -> int:
+def score_review_candidate(url: str, title: str, desc: str, publisher: str, target_core: Optional[str]) -> int:
     """
-    Prefer author pages on publisher domain (best effort).
+    Score for PHASE 2: review/section page *within official domain if possible*.
     """
     u = (url or "").lower()
     t = (title or "").lower()
@@ -234,155 +290,199 @@ def score_author_candidate(url: str, author: str, publisher: str, title: str, de
     text = f"{u} {t} {d}"
 
     score = 0
-    a_slug = safe_slug(author)
+    score += domain_affinity_score(url, publisher)
 
-    # Common author URL patterns
-    if any(k in u for k in ["/author/", "/authors/", "/by/", "/staff/", "/contributors/"]):
-        score += 12
+    # Hard boost if within the target core domain
+    if target_core:
+        if core_domain(get_domain(url)) == target_core:
+            score += 35
+        else:
+            score -= 10
 
-    # Author slug in URL is strong
-    if a_slug and a_slug in u:
+    # Strong review signals
+    if re.search(r"/reviews?\b", u):
+        score += 14
+    if any(k in text for k in ["movie reviews", "film reviews", "reviews archive", "review archive"]):
         score += 10
+    if any(k in u for k in ["/movie-reviews", "/film-reviews", "/reviews/movies", "/reviews/film"]):
+        score += 8
 
-    # Title/desc contains author name
-    if author.lower() in (title or "").lower():
-        score += 5
-    if author.lower() in (desc or "").lower():
-        score += 3
+    # Medium: entertainment/movies sections
+    if any(k in u for k in ["/movies", "/film", "/cinema", "/entertainment"]):
+        score += 4
 
-    # Penalize social/wiki
-    if is_social_or_wiki(u):
-        score -= 30
-
-    # Prefer shallower author pages, penalize deep article pages
+    # Prefer index pages
     depth = path_depth(url)
-    if depth <= 3:
+    if depth <= 2:
         score += 3
     elif depth >= 7:
-        score -= 5
+        score -= 4
 
-    # Weak boost if publisher name appears (not always reliable)
-    if publisher.lower() in text:
-        score += 1
+    # Penalize non-content
+    if any(k in u for k in ["/about", "/privacy", "/terms", "/contact", "/subscribe", "/newsletter", "/donate"]):
+        score -= 15
+    if any(k in u for k in ["/tag/", "/tags/", "/category/", "/topics/"]):
+        score -= 3
 
     return score
 
 
-def pick_best(results: List[Dict], scorer_fn) -> Optional[str]:
+def score_author_candidate(url: str, author: str, publisher: str, title: str, desc: str,
+                           target_core: Optional[str]) -> int:
+    u = (url or "").lower()
+    t = (title or "").lower()
+    d = (desc or "").lower()
+    text = f"{u} {t} {d}"
+
+    score = 0
+    score += domain_affinity_score(url, publisher)
+
+    # Prefer official domain
+    if target_core:
+        if core_domain(get_domain(url)) == target_core:
+            score += 35
+        else:
+            score -= 10
+
+    a_slug = safe_slug(author)
+
+    if any(k in u for k in ["/author/", "/authors/", "/by/", "/staff/", "/contributors/"]):
+        score += 16
+    if a_slug and a_slug in u:
+        score += 10
+    if author.lower() in t:
+        score += 4
+    if author.lower() in d:
+        score += 2
+    if publisher.lower() in text:
+        score += 1
+
+    depth = path_depth(url)
+    if depth <= 3:
+        score += 3
+    elif depth >= 8:
+        score -= 6
+
+    return score
+
+
+# ----------------------------
+# Two-phase discovery
+# ----------------------------
+
+def discover_home(api_key: str, publisher: str, per_query: int = 8) -> Optional[str]:
+    queries = [
+        f'"{publisher}" official site',
+        f'"{publisher}" homepage',
+        f'"{publisher}" website',
+    ]
+    results: List[Dict] = []
+    for q in queries:
+        try:
+            results.extend(brave_search(api_key, q, count=per_query))
+        except Exception:
+            continue
+
+    results = filter_results(results)
+    if not results:
+        return None
+
     best_url = None
     best_score = -10**9
     for r in results:
         url = r.get("url") or ""
         if not url:
             continue
-        title = r.get("title") or ""
-        desc = r.get("description") or ""
-        s = scorer_fn(url, title, desc)
+        s = score_home_candidate(url, r.get("title", ""), r.get("description", ""), publisher)
         if s > best_score:
             best_score = s
             best_url = url
+
+    if best_url:
+        return root_url(best_url) or best_url
+    return None
+
+
+def discover_review_within_domain(api_key: str, publisher: str, home_url: Optional[str],
+                                 per_query: int = 8) -> Optional[str]:
+    target_core = core_domain(get_domain(home_url)) if home_url else None
+    site_clause = f"site:{target_core}" if target_core else ""
+
+    queries = [
+        f'{site_clause} "{publisher}" "movie reviews"',
+        f'{site_clause} "{publisher}" "film reviews"',
+        f"{site_clause} reviews movies",
+        f"{site_clause} film reviews",
+        f"{site_clause} movie reviews",
+    ]
+
+    results: List[Dict] = []
+    for q in queries:
+        qn = normalize_ws(q)
+        if not qn:
+            continue
+        try:
+            results.extend(brave_search(api_key, qn, count=per_query))
+        except Exception:
+            continue
+
+    results = filter_results(results)
+    if not results:
+        return None
+
+    best_url = None
+    best_score = -10**9
+    for r in results:
+        url = r.get("url") or ""
+        if not url:
+            continue
+        s = score_review_candidate(url, r.get("title", ""), r.get("description", ""), publisher, target_core)
+        if s > best_score:
+            best_score = s
+            best_url = url
+
     return best_url
 
 
-# ----------------------------
-# Discovery routines
-# ----------------------------
+def discover_author_within_domain(api_key: str, publisher: str, author: str, home_url: Optional[str],
+                                 per_query: int = 8) -> Optional[str]:
+    target_core = core_domain(get_domain(home_url)) if home_url else None
+    site_clause = f"site:{target_core}" if target_core else ""
 
-def discover_publication_review_url(api_key: str, publisher: str, per_query: int = 8) -> Optional[str]:
-    # High-signal queries first. Keep this short for speed.
     queries = [
-        f'"{publisher}" "movie reviews"',
-        f'"{publisher}" "film reviews"',
-        f'"{publisher}" reviews movies',
+        f'{site_clause} "{author}" author',
+        f'{site_clause} "{author}" "/author/"',
+        f'{site_clause} "{author}" "/by/"',
+        f'{site_clause} "{author}" staff',
+        f'{site_clause} "{author}" contributor',
     ]
 
     results: List[Dict] = []
     for q in queries:
-        try:
-            results.extend(brave_search(api_key, q, count=per_query))
-        except requests.HTTPError:
-            # Bubble up (caller may want to backoff), but keep robust for single failures.
+        qn = normalize_ws(q)
+        if not qn:
             continue
+        try:
+            results.extend(brave_search(api_key, qn, count=per_query))
         except Exception:
             continue
 
+    results = filter_results(results)
     if not results:
         return None
 
-    best = None
+    best_url = None
     best_score = -10**9
     for r in results:
         url = r.get("url") or ""
         if not url:
             continue
-        s = score_publication_review_candidate(url, r.get("title", ""), r.get("description", ""))
+        s = score_author_candidate(url, author, publisher, r.get("title", ""), r.get("description", ""), target_core)
         if s > best_score:
             best_score = s
-            best = url
+            best_url = url
 
-    return best
-
-
-def discover_publication_home_url(api_key: str, publisher: str, per_query: int = 8) -> Optional[str]:
-    queries = [
-        f'"{publisher}" official site',
-        f'"{publisher}" homepage',
-    ]
-
-    results: List[Dict] = []
-    for q in queries:
-        try:
-            results.extend(brave_search(api_key, q, count=per_query))
-        except Exception:
-            continue
-
-    if not results:
-        return None
-
-    best = None
-    best_score = -10**9
-    for r in results:
-        url = r.get("url") or ""
-        if not url:
-            continue
-        s = score_publication_home_candidate(url, r.get("title", ""), r.get("description", ""))
-        if s > best_score:
-            best_score = s
-            best = url
-    return best
-
-
-def discover_author_url(api_key: str, publisher: str, author: str, per_query: int = 8) -> Optional[str]:
-    # A few targeted templates. Keep short for speed.
-    queries = [
-        f'"{author}" "{publisher}" author',
-        f'"{author}" "{publisher}" "/author/"',
-        f'"{author}" "{publisher}" "/by/"',
-        f'"{author}" "{publisher}" film review',
-    ]
-
-    results: List[Dict] = []
-    for q in queries:
-        try:
-            results.extend(brave_search(api_key, q, count=per_query))
-        except Exception:
-            continue
-
-    if not results:
-        return None
-
-    best = None
-    best_score = -10**9
-    for r in results:
-        url = r.get("url") or ""
-        if not url:
-            continue
-        s = score_author_candidate(url, author, publisher, r.get("title", ""), r.get("description", ""))
-        if s > best_score:
-            best_score = s
-            best = url
-
-    return best
+    return best_url
 
 
 # ----------------------------
@@ -391,7 +491,7 @@ def discover_author_url(api_key: str, publisher: str, author: str, per_query: in
 
 def load_existing_keys(existing_csv_path: Optional[str]) -> Set[Tuple[str, str, str]]:
     """
-    Returns keys for skipping already discovered items:
+    Skip keys:
       (publication_id, author_lower_or_empty, source_url_type)
     """
     keys: Set[Tuple[str, str, str]] = set()
@@ -423,7 +523,7 @@ def main() -> None:
     ap.add_argument("--input", required=True, help="Input CSV: publisher,rt_publisher_url,authors")
     ap.add_argument("--output", required=True, help="Output CSV with 5 columns")
     ap.add_argument("--existing", default="", help="Existing merged output to skip already done work")
-    ap.add_argument("--sleep", type=float, default=0.2, help="Sleep seconds between API calls (per row/author)")
+    ap.add_argument("--sleep", type=float, default=0.2, help="Sleep seconds between API calls")
     ap.add_argument("--shard-index", type=int, default=0, help="Shard index (0..shard-count-1)")
     ap.add_argument("--shard-count", type=int, default=1, help="Number of shards")
     ap.add_argument("--per-query", type=int, default=8, help="Brave results per query")
@@ -442,12 +542,12 @@ def main() -> None:
         reader = csv.DictReader(f)
         required = {"publisher", "rt_publisher_url", "authors"}
         if not reader.fieldnames or not required.issubset(set(reader.fieldnames)):
-            raise SystemExit(f"Input must have columns exactly including: {sorted(required)}. Found: {reader.fieldnames}")
+            raise SystemExit(f"Input must have columns including: {sorted(required)}. Found: {reader.fieldnames}")
         in_rows = list(reader)
 
-    # Write output
     out_fields = ["publication_id", "publication", "author", "source_url", "source_url_type"]
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+
     with open(args.output, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=out_fields)
         w.writeheader()
@@ -464,57 +564,62 @@ def main() -> None:
             if not publisher or not pub_id:
                 continue
 
-            # Author-scoped publication
+            # Phase 1: find official home
+            home_key = (pub_id, "", "publication_home")
+            home_url: Optional[str] = None
+            if home_key not in existing_keys:
+                home_url = discover_home(api_key, publisher, per_query=args.per_query)
+                if home_url and not is_blocked(home_url):
+                    w.writerow({
+                        "publication_id": pub_id,
+                        "publication": publisher,
+                        "author": "",
+                        "source_url": home_url,
+                        "source_url_type": "publication_home",
+                    })
+                    existing_keys.add(home_key)
+                time.sleep(args.sleep)
+            else:
+                # If we skipped writing home, still try to recover a home_url for phase 2 by searching lightly.
+                # (Avoids needing to read existing file for the actual URL.)
+                home_url = discover_home(api_key, publisher, per_query=max(4, args.per_query // 2))
+                time.sleep(args.sleep)
+
+            # Author-scoped publications
             if authors:
                 for author in authors:
-                    skip_key = (pub_id, author.lower(), "publication_with_author")
-                    if skip_key in existing_keys:
+                    akey = (pub_id, author.lower(), "publication_with_author")
+                    if akey in existing_keys:
                         continue
 
-                    url = discover_author_url(api_key, publisher, author, per_query=args.per_query)
-                    if url:
+                    aurl = discover_author_within_domain(api_key, publisher, author, home_url, per_query=args.per_query)
+                    if aurl and not is_blocked(aurl):
                         w.writerow({
                             "publication_id": pub_id,
                             "publication": publisher,
                             "author": author,
-                            "source_url": url,
+                            "source_url": aurl,
                             "source_url_type": "publication_with_author",
                         })
-                        existing_keys.add(skip_key)
-
+                        existing_keys.add(akey)
                     time.sleep(args.sleep)
 
-            # Publication-scoped publication
+            # Publication-scoped publications: also find a review/section page
             else:
-                # Try review index first
-                review_key = (pub_id, "", "publication_review")
-                if review_key not in existing_keys:
-                    review_url = discover_publication_review_url(api_key, publisher, per_query=args.per_query)
-                    if review_url:
-                        w.writerow({
-                            "publication_id": pub_id,
-                            "publication": publisher,
-                            "author": "",
-                            "source_url": review_url,
-                            "source_url_type": "publication_review",
-                        })
-                        existing_keys.add(review_key)
-                    time.sleep(args.sleep)
-
-                # Then home page fallback (still useful even if review exists)
-                home_key = (pub_id, "", "publication_home")
-                if home_key not in existing_keys:
-                    home_url = discover_publication_home_url(api_key, publisher, per_query=args.per_query)
-                    if home_url:
-                        w.writerow({
-                            "publication_id": pub_id,
-                            "publication": publisher,
-                            "author": "",
-                            "source_url": home_url,
-                            "source_url_type": "publication_home",
-                        })
-                        existing_keys.add(home_key)
-                    time.sleep(args.sleep)
+                rkey = (pub_id, "", "publication_review")
+                if rkey in existing_keys:
+                    continue
+                rurl = discover_review_within_domain(api_key, publisher, home_url, per_query=args.per_query)
+                if rurl and not is_blocked(rurl):
+                    w.writerow({
+                        "publication_id": pub_id,
+                        "publication": publisher,
+                        "author": "",
+                        "source_url": rurl,
+                        "source_url_type": "publication_review",
+                    })
+                    existing_keys.add(rkey)
+                time.sleep(args.sleep)
 
 
 if __name__ == "__main__":
