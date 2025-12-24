@@ -42,7 +42,7 @@ jobs:
         run: |
           mkdir -p outputs
           python discover_starting_urls.py \
-            --input data/publications_input.csv \
+            --input publications.csv \
             --output outputs/starting_urls_${{ matrix.shard_index }}.csv \
             --sleep 0.2 \
             --shard-index ${{ matrix.shard_index }} \
